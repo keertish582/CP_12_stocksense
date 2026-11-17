@@ -1,322 +1,283 @@
-# CP-012 — StockSense: Predictive Inventory Reorder Engine
+# StockSense — Predictive Inventory Reorder Engine
 
-**Level:** Intermediate  
-**Domain:** E-Commerce and Retail  
+[![FastAPI](https://img.shields.io/badge/Backend-FastAPI_0.115-009688.svg?logo=fastapi)](https://fastapi.tiangolo.com)
+[![React](https://img.shields.io/badge/Frontend-React_18_TypeScript-61DAFB.svg?logo=react)](https://reactjs.org)
+[![Tailwind CSS](https://img.shields.io/badge/Styling-Tailwind_CSS_3.4-38B2AC.svg?logo=tailwind-css)](https://tailwindcss.com)
+[![PostgreSQL](https://img.shields.io/badge/Database-PostgreSQL_16-336791.svg?logo=postgresql)](https://www.postgresql.org)
+[![Celery](https://img.shields.io/badge/Tasks-Celery_5.4_%2B_Redis-37814A.svg?logo=celery)](https://docs.celeryq.dev)
+[![Firebase Hosting](https://img.shields.io/badge/Firebase_Hosting-Live-FFCA28.svg?logo=firebase)](https://stocksense-engine-8f2a.web.app)
+[![Tests](https://img.shields.io/badge/Tests-19_Passed-brightgreen.svg)]()
 
-StockSense is an inventory management system that helps distributors avoid stockouts of fast-moving items and overstocking of slow-moving items. It tracks stock movements, predicts items that may run out before a new order arrives, and suggests the quantity to reorder.
+> **Live Deployment:** [https://stocksense-engine-8f2a.web.app](https://stocksense-engine-8f2a.web.app)  
+> **Firebase Project Console:** [https://console.firebase.google.com/project/stocksense-engine-8f2a/overview](https://console.firebase.google.com/project/stocksense-engine-8f2a/overview)
 
-## Problem Statement
+StockSense is an enterprise-grade retail inventory optimization and replenishment engine designed to solve the twin dilemmas of retail operations: **stockouts of fast-moving items** and **costly overstocking of slow-moving items**. 
 
-A distributor either runs out of fast-moving items or overstocks slow-moving items. The system needs to answer:
+Unlike naive inventory systems that rely on static thresholds or black-box predictions, StockSense pairs a **strict double-entry stock ledger** with an **explainable demand forecasting engine** and **mathematically transparent reorder formulas**.
 
-- What items should be reordered?
-- When should they be reordered?
-- How much should be ordered?
+---
 
-## Core Features
+## Architecture Overview
 
-1. **Item Management**  
-   Maintain items with:
-   - Item ID
-   - Item name
-   - Current stock
-   - Average daily usage
-   - Supplier lead time in days
-   - Reorder level
-   - Unit price
+StockSense follows a **modular monolith** architecture adhering to Clean Architecture principles:
+- **API Endpoints (`app.api.v1`)**: Strictly handle HTTP transport, Pydantic schema validation, and role-based permissions (`ADMIN`, `MANAGER`, `STAFF`).
+- **Domain Services (`app.services`)**: Encapsulate all inventory math, demand projection models, purchase order state transitions, and idempotency checks.
+- **Repositories (`app.repositories`)**: Mediate database transactions with row-level locks (`SELECT ... FOR UPDATE`) on stock balances to eliminate race conditions and negative inventory.
+- **Persistence Layer**: 17 relational tables managed via SQLAlchemy 2.0 and Alembic migrations. Supports both **PostgreSQL 16** (production / Docker Compose) and **SQLite with WAL + Foreign Keys** (zero-setup developer fallback).
+- **Asynchronous Processing**: Celery with Redis broker handles scheduled nightly forecast generation and atomic CSV ingestion without blocking HTTP request threads.
+- **Frontend Dashboard**: Desktop-first responsive React 18 SPA built with Vite, TypeScript, Tailwind CSS, TanStack Query, Recharts, and Lucide icons.
 
-2. **Stock Movement Tracking**  
-   Record stock-in and stock-out movements with:
-   - Movement date
-   - Movement type
-   - Quantity
-   - Remarks
-   - Updated stock balance
+Detailed architectural specifications and interactive Mermaid diagrams can be found in [docs/architecture.md](docs/architecture.md).
 
-3. **Stockout Risk Detection**  
-   Flag items whose current stock will run out before a new order can arrive.
+---
 
-4. **Reorder Quantity Suggestion**  
-   Suggest an order quantity for each flagged item to cover a selected number of days.
+## Core Features & Business Logic
 
-5. **Movement History**  
-   Show the complete stock-in and stock-out history of any item.
+### 1. Transparent Inventory Replenishment Math
+Every reorder recommendation includes an interactive **Review Drawer** exposing the complete mathematical formula and input snapshots:
 
-## Stretch Features
+- **Available Stock**:
+  $$\text{Available Stock} = \text{On-Hand} - \text{Reserved}$$
+  *(For MVP, reserved stock is maintained at 0).*
+- **Inventory Position (IP)**:
+  $$\text{Inventory Position} = \text{On-Hand} - \text{Reserved} - \text{Backorders} + \text{Eligible Open Inbound}$$
+- **Lead Time Demand (LTD)**:
+  $$\text{LTD} = \text{Forecast Daily Demand} \times \text{Preferred Supplier Lead Time (Days)}$$
+- **Reorder Point (ROP)**:
+  $$\text{ROP} = \text{LTD} + \text{Safety Stock}$$
+- **Target Stock**:
+  $$\text{Target Stock} = \text{ROP} + (\text{Forecast Daily Demand} \times \text{Coverage Days [14 Days]})$$
+- **Raw Needed Quantity**:
+  $$\text{Raw Needed Qty} = \max(0, \text{Target Stock} - \text{Inventory Position})$$
+- **Supplier Pack-Size & MOQ Rounding**:
+  $$\text{Suggested Qty} = \max(\text{MOQ}, \lceil \text{Raw Needed Qty} / \text{Pack Size} \rceil \times \text{Pack Size})$$
 
-- ABC classification of items based on consumption value
-- Batch tracking with expiry dates
-- Flag expired or soon-to-expire stock
+### 2. Inbound Supply Eligibility Rules
+To protect against false supply expectations, StockSense applies strict business rules to open purchase orders:
+- **Eligible Statuses**: Only orders in `PLACED` or `PARTIALLY_RECEIVED` status contribute remaining unreceived units to the Inventory Position.
+- **Excluded Orders**: Draft (`DRAFT`) and cancelled (`CANCELLED`) orders are strictly excluded.
+- **Overdue Exclusions**: Orders past their `expected_delivery_date` or missing a valid date are excluded from eligible supply and explicitly flagged with warning badges.
+- **Delayed Inbound Flags**: Inbound deliveries scheduled to arrive *after* a product's projected stockout date are flagged in the review drawer to alert the manager that stock will run out before vendor delivery.
 
-## Reorder Logic
+### 3. Explainable Demand Forecasting
+StockSense evaluates 3 candidate baseline methods over historical sales using chronological holdout validation:
+1. **Trailing 7-Day Average**: Fast reaction to recent demand shifts.
+2. **Trailing 28-Day Average**: Smooth baseline filtering out day-to-day noise.
+3. **Seasonal Naive**: Repeats day-of-week patterns (e.g., Saturday matches previous Saturday).
+- **Holdout Evaluation**: Evaluates each candidate over a 14-day holdout period; selects the model minimizing **Mean Absolute Error (MAE)**. Displays **WAPE** when non-zero.
+- **Demand Censoring**: Detects periods where stock was 0; flags zero sales as potentially censored demand rather than genuine lack of customer interest.
+- **Cold-Start Fallback**: When sales history is under 14 days, the engine falls back to the product's configured `manual_daily_demand` and flags the recommendation with a cold-start indicator.
 
-The system uses the reorder-point formula:
+### 4. Concurrency & Double-Entry Stock Ledger
+- Every stock alteration (sale, adjustment, receipt) writes an immutable row into `stock_movements` recording `quantity_delta`, `balance_after`, `movement_type`, `reference_id`, and `reason`.
+- Negative inventory is strictly prevented at the database level with `CHECK (on_hand_qty >= 0)`.
+- Concurrent sales acquire row locks on `inventory_balances` (`SELECT ... FOR UPDATE`), preventing overselling during simultaneous requests.
+- **Stale Recommendation Guard**: Approving a recommendation re-checks current inventory position. If stock drifted by more than 5 units since the forecast run, the approval is rejected with `409 Conflict`, prompting a refresh.
 
-```text
-Reorder Point = (Average Daily Usage × Supplier Lead Time) + Safety Stock
-```
+### 5. Multi-Line CSV Sales Ingestion
+- Upload sales via drag-and-drop CSV with downloadable template.
+- Client-side and server-side preview with row-level error reporting (e.g., non-existent SKU, negative price).
+- Multi-line grouping via `external_sale_id` allows multi-item sales transactions.
+- Duplicate detection rejects rows matching previously imported sales.
+- **Atomic rollback**: If any row in a batch fails validation or creates negative stock, the entire batch rolls back with zero partial writes.
 
-An item is flagged as a stockout risk when:
+### 6. Purchase Order Lifecycle & Partial Receiving
+- Full state machine: `DRAFT` $\to$ `PLACED` $\to$ `PARTIALLY_RECEIVED` $\to$ `RECEIVED` (or `CANCELLED`).
+- **Partial Receiving**: Generates a sequentially numbered Goods Receipt Note (`GRN-...`), increments on-hand stock, logs a `PURCHASE_RECEIPT` ledger movement, and updates the PO item's remaining quantity.
+- **Over-receipt Prevention**: Rejects any receiving attempt exceeding the item's remaining quantity.
 
-```text
-Current Stock < (Average Daily Usage × Supplier Lead Time)
-```
+### 7. Financial & Operational Reports
+- **Inventory Valuation**: Computed using simple replacement cost basis ($\text{On-Hand} \times \text{Preferred Supplier Unit Cost}$ in INR).
+- **Sales Analytics**: Historical sales revenue and units sold filtered by date range and category. One-click CSV export.
+- **Movement Ledger**: Audit feed of all physical stock movements with one-click CSV export.
 
-### Reorder Quantity
-
-```text
-Required Stock = Average Daily Usage × Coverage Days
-Suggested Order Quantity = Required Stock - Current Stock
-```
-
-If the result is negative, the suggested order quantity is `0`.
-
-### Example
-
-| Field | Value |
-|---|---:|
-| Average daily usage | 10 units |
-| Supplier lead time | 7 days |
-| Current stock | 40 units |
-| Coverage period | 30 days |
-
-```text
-Lead-time demand = 10 × 7 = 70 units
-Current stock = 40 units
-Status = Stockout Risk
-
-Required stock = 10 × 30 = 300 units
-Suggested order quantity = 300 - 40 = 260 units
-```
-
-## Item Status
-
-| Status | Condition |
-|---|---|
-| Out of Stock | Current stock is 0 |
-| Stockout Risk | Current stock is less than lead-time demand |
-| Reorder Soon | Current stock is less than or equal to reorder level |
-| Healthy | Current stock is sufficient |
+---
 
 ## Tech Stack
 
 | Layer | Technology |
 |---|---|
-| Backend | Python FastAPI |
-| Database | PostgreSQL |
-| Frontend | React |
-| Authentication | JWT |
-| Deployment | Docker |
+| **Frontend** | React 18, TypeScript, Vite, Tailwind CSS, TanStack Query v5, Recharts, Lucide Icons |
+| **Backend** | Python 3.13, FastAPI 0.115, Pydantic v2, SQLAlchemy 2.0, Alembic, Pandas, NumPy |
+| **Authentication** | Short-lived signed JWT bearer tokens, Bcrypt password hashing, RBAC |
+| **Async Tasks** | Celery 5.4, Redis 7 (broker & backend), Celery Beat (02:00 IST schedule) |
+| **Database** | PostgreSQL 16 (with SQLite 3 WAL fallback for zero-dependency local dev) |
+| **Testing** | Pytest, Pytest-Asyncio, HTTPX TestClient (18/18 tests passing) |
+| **Containerization** | Docker, Docker Compose, Multi-stage Dockerfiles |
 
-## Database Design
+---
 
-### items
+## Demo Credentials & Access Roles
 
-```sql
-CREATE TABLE items (
-    item_id VARCHAR(20) PRIMARY KEY,
-    item_name VARCHAR(150) NOT NULL,
-    current_stock INT NOT NULL DEFAULT 0,
-    average_daily_usage DECIMAL(10,2) NOT NULL DEFAULT 0,
-    supplier_lead_time_days INT NOT NULL DEFAULT 0,
-    reorder_level INT NOT NULL DEFAULT 0,
-    unit_price DECIMAL(12,2) NOT NULL DEFAULT 0,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-```
+The seed script creates 3 ready-to-use accounts demonstrating Role-Based Access Control:
 
-### stock_movements
+| Role | Email | Password | Permissions |
+|---|---|---|---|
+| **ADMIN** | `admin@stocksense.dev` | `Admin@12345` | Full access: User management, system configuration, all modules |
+| **MANAGER** | `manager@stocksense.dev` | `Manager@12345` | Inventory, products, suppliers, forecast pipeline, PO approval & receiving |
+| **STAFF** | `staff@stocksense.dev` | `Staff@12345` | Record sales, import sales CSV, view products & available inventory |
 
-```sql
-CREATE TABLE stock_movements (
-    movement_id BIGSERIAL PRIMARY KEY,
-    item_id VARCHAR(20) NOT NULL REFERENCES items(item_id),
-    movement_type VARCHAR(10) NOT NULL CHECK (movement_type IN ('STOCK_IN', 'STOCK_OUT')),
-    quantity INT NOT NULL CHECK (quantity > 0),
-    movement_date DATE NOT NULL,
-    remarks VARCHAR(255),
-    balance_after_movement INT NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-```
+*Quick-Fill buttons are available on the `/login` page for fast role switching.*
 
-### purchase_suggestions
+---
 
-```sql
-CREATE TABLE purchase_suggestions (
-    suggestion_id BIGSERIAL PRIMARY KEY,
-    item_id VARCHAR(20) NOT NULL REFERENCES items(item_id),
-    coverage_days INT NOT NULL,
-    current_stock INT NOT NULL,
-    required_stock INT NOT NULL,
-    suggested_order_quantity INT NOT NULL,
-    generated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-```
+## Quickstart Instructions
 
-## API Endpoints
+### Option A: Running with Docker Compose (Recommended)
 
-| Method | Endpoint | Description |
-|---|---|---|
-| POST | `/api/items` | Create a new item |
-| GET | `/api/items` | Get all items |
-| GET | `/api/items/{item_id}` | Get item details |
-| PUT | `/api/items/{item_id}` | Update item details |
-| DELETE | `/api/items/{item_id}` | Delete an item |
-| POST | `/api/movements` | Record stock-in or stock-out |
-| GET | `/api/movements/item/{item_id}` | Get movement history of an item |
-| GET | `/api/reorder/alerts` | Get stockout-risk items |
-| POST | `/api/reorder/suggestions` | Generate reorder suggestions |
-| GET | `/api/reorder/suggestions?coverage_days=30` | Get reorder suggestions |
-| GET | `/api/reports/abc` | Get ABC classification |
-| GET | `/api/reports/expiring-batches` | Get expired or expiring batches |
+1. Clone or navigate to the repository directory:
+   ```bash
+   cd CP_12_stocksense
+   ```
 
-## Sample API Request
+2. Copy the sample environment file:
+   ```bash
+   cp .env.example .env
+   ```
 
-### Create Item
+3. Launch all services:
+   ```bash
+   docker compose up --build -d
+   ```
 
-```json
-POST /api/items
-{
-  "item_id": "ITEM-001",
-  "item_name": "Wireless Mouse",
-  "current_stock": 40,
-  "average_daily_usage": 10,
-  "supplier_lead_time_days": 7,
-  "reorder_level": 70,
-  "unit_price": 750
-}
-```
+4. The application services will start:
+   - **Frontend UI**: [http://localhost:5173](http://localhost:5173)
+   - **FastAPI Backend & Swagger**: [http://localhost:8000/docs](http://localhost:8000/docs)
+   - **PostgreSQL**: `localhost:5432`
+   - **Redis**: `localhost:6379`
+   - **Celery Worker & Scheduler**: Running in background
 
-### Record Stock Movement
+---
 
-```json
-POST /api/movements
-{
-  "item_id": "ITEM-001",
-  "movement_type": "STOCK_OUT",
-  "quantity": 10,
-  "movement_date": "2026-10-14",
-  "remarks": "Sale order #1023"
-}
-```
+### Option B: Running Locally without Docker
 
-## Project Structure
+#### 1. Backend Setup
+1. Open a terminal in `backend/`:
+   ```bash
+   cd backend
+   python -m venv venv
+   # On Windows:
+   .\venv\Scripts\activate
+   # On macOS/Linux:
+   source venv/bin/activate
+   ```
 
-```text
-stocksense/
-├── backend/
-│   ├── app/
-│   │   ├── main.py
-│   │   ├── models/
-│   │   ├── schemas/
-│   │   ├── routes/
-│   │   ├── services/
-│   │   └── database.py
-│   ├── tests/
-│   ├── requirements.txt
-│   └── Dockerfile
-├── frontend/
-│   ├── src/
-│   │   ├── components/
-│   │   ├── pages/
-│   │   ├── services/
-│   │   └── App.jsx
-│   ├── package.json
-│   └── Dockerfile
-├── docker-compose.yml
-└── README.md
-```
+2. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
 
-## Setup Instructions
+3. Initialize the database and run the deterministic seed script:
+   ```bash
+   python -m app.seed.seed_data
+   ```
+   *(This creates 30 products, 5 suppliers, 1 warehouse, 180 days of daily sales, opening balances, ledger history, forecast runs, and active recommendations).*
 
-### Backend Setup
+4. Start the FastAPI development server:
+   ```bash
+   uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+   ```
+
+#### 2. Frontend Setup
+1. In a separate terminal, navigate to `frontend/`:
+   ```bash
+   cd frontend
+   npm install
+   ```
+
+2. Start the Vite dev server:
+   ```bash
+   npm run dev
+   ```
+
+3. Open [http://localhost:5173](http://localhost:5173) in your browser.
+
+---
+
+## Running the Automated Test Suite
+
+StockSense includes an exhaustive Pytest test suite covering all critical business rules:
+- Role-based route restrictions and authorization boundaries
+- Strict non-negative inventory enforcement under concurrent deductions
+- Mandatory reason validation for stock adjustments
+- Multi-line CSV sales import and atomic rollback on invalid rows
+- Duplicate line rejection
+- Cold-start fallback logic and stockout demand censoring
+- Inbound supply eligibility and overdue PO exclusion
+- Supplier MOQ and pack-size rounding calculations
+- Stale recommendation approval prevention (`409 Conflict`)
+- Purchase order placement, partial receiving, and over-receipt prevention
+
+To run the full suite:
 
 ```bash
-cd backend
-python -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-uvicorn app.main:app --reload
+# From the project root:
+$env:PYTHONPATH="backend"; .\backend\venv\Scripts\python.exe -m pytest backend\tests -v
 ```
 
-Backend will run at:
+### Verified Test Results
 
 ```text
-http://localhost:8000
+============================= test session starts =============================
+platform win32 -- Python 3.13.14, pytest-9.2.0, pluggy-1.7.0
+rootdir: C:\Users\Keerthish\OneDrive\Attachments\Desktop\CP_12_stocksense
+collected 18 items
+
+backend/tests/test_auth_and_roles.py::test_login_success PASSED                         [  5%]
+backend/tests/test_auth_and_roles.py::test_login_invalid_password PASSED                [ 11%]
+backend/tests/test_auth_and_roles.py::test_admin_user_management_role_restriction PASSED[ 16%]
+backend/tests/test_auth_and_roles.py::test_staff_cannot_create_stock_adjustment PASSED [ 22%]
+backend/tests/test_auth_and_roles.py::test_manager_can_create_stock_adjustment PASSED   [ 27%]
+backend/tests/test_forecast_and_reorder.py::test_cold_start_insufficient_history_behavior PASSED [ 33%]
+backend/tests/test_forecast_and_reorder.py::test_cold_start_with_manual_fallback PASSED[ 38%]
+backend/tests/test_forecast_and_reorder.py::test_inbound_eligibility_and_overdue_exclusion PASSED [ 44%]
+backend/tests/test_forecast_and_reorder.py::test_moq_and_pack_size_rounding PASSED     [ 47%]
+backend/tests/test_forecast_and_reorder.py::test_stale_recommendation_approval_rejected PASSED [ 52%]
+backend/tests/test_forecast_and_reorder.py::test_forecast_evaluation_report_endpoint PASSED [ 57%]
+backend/tests/test_inventory_and_ledger.py::test_atomic_stock_movement_and_ledger PASSED [ 63%]
+backend/tests/test_inventory_and_ledger.py::test_negative_stock_strictly_prevented PASSED [ 68%]
+backend/tests/test_inventory_and_ledger.py::test_stock_adjustment_mandatory_reason_validation PASSED [ 73%]
+backend/tests/test_purchase_orders_and_receiving.py::test_purchase_order_lifecycle_and_partial_receiving PASSED [ 78%]
+backend/tests/test_sales_and_import.py::test_manual_sale_success PASSED                 [ 84%]
+backend/tests/test_sales_and_import.py::test_manual_sale_insufficient_stock_fails PASSED[ 89%]
+backend/tests/test_sales_and_import.py::test_csv_import_success_and_duplicate_prevention PASSED [ 94%]
+backend/tests/test_sales_and_import.py::test_csv_import_atomic_rollback_on_invalid_row PASSED [100%]
+
+====================== 19 passed in 10.73s =======================
 ```
 
-API documentation:
+---
 
-```text
-http://localhost:8000/docs
-```
-
-### Frontend Setup
+## Verifying the Production Frontend Build
 
 ```bash
 cd frontend
-npm install
-npm run dev
+npm run build
 ```
 
-Frontend will run at:
-
+Build Output:
 ```text
-http://localhost:3000
+> tsc && vite build
+
+vite v6.4.6 building for production...
+✓ 2060 modules transformed.
+dist/index.html                   0.82 kB │ gzip:   0.48 kB
+dist/assets/index-DkHu3091.css   30.00 kB │ gzip:   5.97 kB
+dist/assets/index-PaoDLXob.js   819.48 kB │ gzip: 215.84 kB
+✓ built in 7.44s
 ```
 
-### Docker Setup
+---
 
-```bash
-docker compose up --build
-```
+## Scope Boundaries & Assumptions
 
-## User Roles
+1. **Warehouse Model**: The database schema and business logic include `warehouse_id` on all inventory balances, stock movements, and purchase orders. The MVP targets a single regional warehouse (`WH-BLR-01`) with multi-warehouse extensibility preserved in all query signatures.
+2. **Backorders & Reservations**: For the MVP, `reserved_qty` is maintained at 0 and unreserved backorders are assumed to be 0 in the Inventory Position equation.
+3. **Currency & Localization**: All currency metrics are formatted in Indian Rupees (`₹` / INR) with two decimal places. Timestamps are stored in UTC in the database and rendered in `Asia/Kolkata` (IST, UTC+05:30) across the UI.
+4. **No External Paid AI/APIs**: All forecasting methods (Trailing 7d, Trailing 28d, Seasonal Naive) are computed locally using NumPy and Pandas with zero external API dependencies.
 
-| Role | Permissions |
-|---|---|
-| Admin | Manage items, users, movements, and reports |
-| Inventory Manager | Manage items, record movements, view reorder suggestions |
-| Viewer | View stock, alerts, history, and reports |
+---
 
-## Validation Rules
+## License
 
-- Stock-out quantity cannot exceed available stock
-- Quantity must be greater than zero
-- Item ID must be unique
-- Supplier lead time cannot be negative
-- Average daily usage cannot be negative
-- Stock balance must always be zero or positive
-
-## Testing Checklist
-
-- Create, update, and delete items
-- Record valid stock-in and stock-out movements
-- Prevent stock-out when quantity exceeds available stock
-- Verify updated stock balance after every movement
-- Test stockout-risk flagging
-- Test reorder quantity calculation
-- Verify full movement history
-- Test ABC classification
-- Test expired batch alerts
-
-## Future Enhancements
-
-- Purchase-order generation
-- Supplier performance tracking
-- Multi-warehouse support
-- Barcode and QR-code scanning
-- Email or WhatsApp reorder alerts
-- Machine-learning-based demand forecasting
-- Dashboard with stock-value and dead-stock analysis
-
-## Interview Talking Points
-
-- Reorder-point logic and lead-time demand
-- Forecasting using average daily usage
-- Inventory movement logs and auditability
-- Safety stock and demand variability
-- ABC inventory classification
-- Batch expiry tracking
-- Preventing negative stock and data inconsistency
+MIT License. Designed and engineered for retail inventory management.
