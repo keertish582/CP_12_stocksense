@@ -1,283 +1,199 @@
-# StockSense — Predictive Inventory Reorder Engine
+# StockSense (CP-012)
+**Predictive Inventory Reorder Engine (E-Commerce and Retail, Intermediate level)**
 
-[![FastAPI](https://img.shields.io/badge/Backend-FastAPI_0.115-009688.svg?logo=fastapi)](https://fastapi.tiangolo.com)
-[![React](https://img.shields.io/badge/Frontend-React_18_TypeScript-61DAFB.svg?logo=react)](https://reactjs.org)
-[![Tailwind CSS](https://img.shields.io/badge/Styling-Tailwind_CSS_3.4-38B2AC.svg?logo=tailwind-css)](https://tailwindcss.com)
-[![PostgreSQL](https://img.shields.io/badge/Database-PostgreSQL_16-336791.svg?logo=postgresql)](https://www.postgresql.org)
-[![Celery](https://img.shields.io/badge/Tasks-Celery_5.4_%2B_Redis-37814A.svg?logo=celery)](https://docs.celeryq.dev)
-[![Firebase Hosting](https://img.shields.io/badge/Firebase_Hosting-Live-FFCA28.svg?logo=firebase)](https://stocksense-engine-8f2a.web.app)
-[![Tests](https://img.shields.io/badge/Tests-19_Passed-brightgreen.svg)]()
-
-> **Live Deployment:** [https://stocksense-engine-8f2a.web.app](https://stocksense-engine-8f2a.web.app)  
-> **Firebase Project Console:** [https://console.firebase.google.com/project/stocksense-engine-8f2a/overview](https://console.firebase.google.com/project/stocksense-engine-8f2a/overview)
-
-StockSense is an enterprise-grade retail inventory optimization and replenishment engine designed to solve the twin dilemmas of retail operations: **stockouts of fast-moving items** and **costly overstocking of slow-moving items**. 
-
-Unlike naive inventory systems that rely on static thresholds or black-box predictions, StockSense pairs a **strict double-entry stock ledger** with an **explainable demand forecasting engine** and **mathematically transparent reorder formulas**.
+StockSense is a high-reliability, zero-external-dependency Python command-line engine that analyzes historical sales transactions and product inventory to forecast customer demand, calculate statistical safety stock and reorder points, determine economic batch replenishment quantities, and prioritize stock reorders by operational urgency.
 
 ---
 
-## Architecture Overview
-
-StockSense follows a **modular monolith** architecture adhering to Clean Architecture principles:
-- **API Endpoints (`app.api.v1`)**: Strictly handle HTTP transport, Pydantic schema validation, and role-based permissions (`ADMIN`, `MANAGER`, `STAFF`).
-- **Domain Services (`app.services`)**: Encapsulate all inventory math, demand projection models, purchase order state transitions, and idempotency checks.
-- **Repositories (`app.repositories`)**: Mediate database transactions with row-level locks (`SELECT ... FOR UPDATE`) on stock balances to eliminate race conditions and negative inventory.
-- **Persistence Layer**: 17 relational tables managed via SQLAlchemy 2.0 and Alembic migrations. Supports both **PostgreSQL 16** (production / Docker Compose) and **SQLite with WAL + Foreign Keys** (zero-setup developer fallback).
-- **Asynchronous Processing**: Celery with Redis broker handles scheduled nightly forecast generation and atomic CSV ingestion without blocking HTTP request threads.
-- **Frontend Dashboard**: Desktop-first responsive React 18 SPA built with Vite, TypeScript, Tailwind CSS, TanStack Query, Recharts, and Lucide icons.
-
-Detailed architectural specifications and interactive Mermaid diagrams can be found in [docs/architecture.md](docs/architecture.md).
+## Features
+- **Auto-Detecting File Loader**: Parses and validates product and sales records in both `.csv` and `.json` formats.
+- **Statistical Demand Forecasting**: Computes moving average daily demand and standard deviation over a sliding $N$-day window (filling days without transactions as 0 demand).
+- **Outlier Capping**: Optional `--cap-outliers` flag caps sudden demand spikes at $\mu + 3\sigma$.
+- **Automated Reorder Point (ROP)**: Integrates supplier lead times and configurable $Z$-score service levels (default 95% / $Z=1.65$).
+- **Batch-Rounded EOQ**: Recommends Economic Order Quantities based on unit cost, annual demand, and order holding costs, respecting supplier `min_order_qty` constraints.
+- **Urgency Classification**: Categorizes SKUs into `CRITICAL`, `REORDER`, `OK`, and `OVERSTOCK` with ANSI terminal colors and aligned tabular reporting.
+- **Reorder List Export**: Filters and exports actionable replenishment batches (`CRITICAL` and `REORDER`) to CSV.
+- **Interactive Terminal Menu**: Inspect forecasts per SKU, update live stock, record sales transactions, and re-run simulations.
 
 ---
 
-## Core Features & Business Logic
+## Project Structure
 
-### 1. Transparent Inventory Replenishment Math
-Every reorder recommendation includes an interactive **Review Drawer** exposing the complete mathematical formula and input snapshots:
-
-- **Available Stock**:
-  $$\text{Available Stock} = \text{On-Hand} - \text{Reserved}$$
-  *(For MVP, reserved stock is maintained at 0).*
-- **Inventory Position (IP)**:
-  $$\text{Inventory Position} = \text{On-Hand} - \text{Reserved} - \text{Backorders} + \text{Eligible Open Inbound}$$
-- **Lead Time Demand (LTD)**:
-  $$\text{LTD} = \text{Forecast Daily Demand} \times \text{Preferred Supplier Lead Time (Days)}$$
-- **Reorder Point (ROP)**:
-  $$\text{ROP} = \text{LTD} + \text{Safety Stock}$$
-- **Target Stock**:
-  $$\text{Target Stock} = \text{ROP} + (\text{Forecast Daily Demand} \times \text{Coverage Days [14 Days]})$$
-- **Raw Needed Quantity**:
-  $$\text{Raw Needed Qty} = \max(0, \text{Target Stock} - \text{Inventory Position})$$
-- **Supplier Pack-Size & MOQ Rounding**:
-  $$\text{Suggested Qty} = \max(\text{MOQ}, \lceil \text{Raw Needed Qty} / \text{Pack Size} \rceil \times \text{Pack Size})$$
-
-### 2. Inbound Supply Eligibility Rules
-To protect against false supply expectations, StockSense applies strict business rules to open purchase orders:
-- **Eligible Statuses**: Only orders in `PLACED` or `PARTIALLY_RECEIVED` status contribute remaining unreceived units to the Inventory Position.
-- **Excluded Orders**: Draft (`DRAFT`) and cancelled (`CANCELLED`) orders are strictly excluded.
-- **Overdue Exclusions**: Orders past their `expected_delivery_date` or missing a valid date are excluded from eligible supply and explicitly flagged with warning badges.
-- **Delayed Inbound Flags**: Inbound deliveries scheduled to arrive *after* a product's projected stockout date are flagged in the review drawer to alert the manager that stock will run out before vendor delivery.
-
-### 3. Explainable Demand Forecasting
-StockSense evaluates 3 candidate baseline methods over historical sales using chronological holdout validation:
-1. **Trailing 7-Day Average**: Fast reaction to recent demand shifts.
-2. **Trailing 28-Day Average**: Smooth baseline filtering out day-to-day noise.
-3. **Seasonal Naive**: Repeats day-of-week patterns (e.g., Saturday matches previous Saturday).
-- **Holdout Evaluation**: Evaluates each candidate over a 14-day holdout period; selects the model minimizing **Mean Absolute Error (MAE)**. Displays **WAPE** when non-zero.
-- **Demand Censoring**: Detects periods where stock was 0; flags zero sales as potentially censored demand rather than genuine lack of customer interest.
-- **Cold-Start Fallback**: When sales history is under 14 days, the engine falls back to the product's configured `manual_daily_demand` and flags the recommendation with a cold-start indicator.
-
-### 4. Concurrency & Double-Entry Stock Ledger
-- Every stock alteration (sale, adjustment, receipt) writes an immutable row into `stock_movements` recording `quantity_delta`, `balance_after`, `movement_type`, `reference_id`, and `reason`.
-- Negative inventory is strictly prevented at the database level with `CHECK (on_hand_qty >= 0)`.
-- Concurrent sales acquire row locks on `inventory_balances` (`SELECT ... FOR UPDATE`), preventing overselling during simultaneous requests.
-- **Stale Recommendation Guard**: Approving a recommendation re-checks current inventory position. If stock drifted by more than 5 units since the forecast run, the approval is rejected with `409 Conflict`, prompting a refresh.
-
-### 5. Multi-Line CSV Sales Ingestion
-- Upload sales via drag-and-drop CSV with downloadable template.
-- Client-side and server-side preview with row-level error reporting (e.g., non-existent SKU, negative price).
-- Multi-line grouping via `external_sale_id` allows multi-item sales transactions.
-- Duplicate detection rejects rows matching previously imported sales.
-- **Atomic rollback**: If any row in a batch fails validation or creates negative stock, the entire batch rolls back with zero partial writes.
-
-### 6. Purchase Order Lifecycle & Partial Receiving
-- Full state machine: `DRAFT` $\to$ `PLACED` $\to$ `PARTIALLY_RECEIVED` $\to$ `RECEIVED` (or `CANCELLED`).
-- **Partial Receiving**: Generates a sequentially numbered Goods Receipt Note (`GRN-...`), increments on-hand stock, logs a `PURCHASE_RECEIPT` ledger movement, and updates the PO item's remaining quantity.
-- **Over-receipt Prevention**: Rejects any receiving attempt exceeding the item's remaining quantity.
-
-### 7. Financial & Operational Reports
-- **Inventory Valuation**: Computed using simple replacement cost basis ($\text{On-Hand} \times \text{Preferred Supplier Unit Cost}$ in INR).
-- **Sales Analytics**: Historical sales revenue and units sold filtered by date range and category. One-click CSV export.
-- **Movement Ledger**: Audit feed of all physical stock movements with one-click CSV export.
+```text
+stocksense/
+├── stocksense.py          # CLI entry point, argument parser, and interactive menu
+├── loader.py              # CSV/JSON file reading, schema validation, and edge-case handling
+├── forecast.py            # Moving average, standard deviation, and outlier capping
+├── rules.py               # Safety stock, ROP, EOQ, and status classification logic
+├── report.py              # Terminal table alignment, ANSI color formatting, and CSV export
+├── data/
+│   ├── products.csv       # Sample product catalog (12 products)
+│   └── sales.csv          # Sample sales transactions (60 days)
+├── tests/                 # Comprehensive pytest test suite
+│   ├── test_forecast.py
+│   ├── test_rules.py
+│   ├── test_loader.py
+│   └── test_cli_and_report.py
+└── README.md              # Project documentation and formulas
+```
 
 ---
 
-## Tech Stack
+## Mathematical Formulas & Core Logic
 
-| Layer | Technology |
-|---|---|
-| **Frontend** | React 18, TypeScript, Vite, Tailwind CSS, TanStack Query v5, Recharts, Lucide Icons |
-| **Backend** | Python 3.13, FastAPI 0.115, Pydantic v2, SQLAlchemy 2.0, Alembic, Pandas, NumPy |
-| **Authentication** | Short-lived signed JWT bearer tokens, Bcrypt password hashing, RBAC |
-| **Async Tasks** | Celery 5.4, Redis 7 (broker & backend), Celery Beat (02:00 IST schedule) |
-| **Database** | PostgreSQL 16 (with SQLite 3 WAL fallback for zero-dependency local dev) |
-| **Testing** | Pytest, Pytest-Asyncio, HTTPX TestClient (18/18 tests passing) |
-| **Containerization** | Docker, Docker Compose, Multi-stage Dockerfiles |
+### 1. Moving Average Daily Demand
+Over the last $N$ days (configured via `--window`, default $30$):
+$$\bar{D} = \frac{\sum_{i=1}^{N} \text{sales}_i}{N}$$
+Days within the window with no sales count as $0.0$.
+
+### 2. Daily Demand Standard Deviation
+$$s = \sqrt{\frac{1}{N - 1} \sum_{i=1}^{N} (\text{sales}_i - \bar{D})^2} \quad (N \ge 2)$$
+
+### 3. Outlier Capping (Optional `--cap-outliers`)
+When enabled, daily sales exceeding the upper statistical threshold are capped:
+$$\text{Threshold} = \bar{D} + 3s$$
+
+### 4. Safety Stock ($SS$)
+$$SS = Z \times s \times \sqrt{\text{lead\_time\_days}}$$
+Where $Z = 1.65$ corresponds to a 95% service level (configurable via `--z-score`).
+
+### 5. Reorder Point ($ROP$)
+$$ROP = (\bar{D} \times \text{lead\_time\_days}) + SS$$
+
+### 6. Days of Cover ($DoC$)
+$$\text{Days of Cover} = \frac{\text{current\_stock}}{\bar{D}} \quad (\text{if } \bar{D} > 0)$$
+*(If $\bar{D} = 0$, avoids division by zero and reports `N/A`).*
+
+### 7. Economic Order Quantity ($EOQ$) & Batch Rounding
+$$\text{Annual Demand } (D_a) = \bar{D} \times 365$$
+$$\text{Holding Cost } (H) = \text{holding\_cost\_pct} \times \text{unit\_cost} \quad (\text{default } 20\%)$$
+$$\text{Raw EOQ} = \sqrt{\frac{2 \times D_a \times \text{order\_cost}}{H}} \quad (\text{order\_cost default } \$500)$$
+$$\text{EOQ} = \lceil \text{Raw EOQ} \rceil$$
+$$\text{Order Qty} = \max(\text{min\_order\_qty}, \lceil \text{EOQ} / \text{min\_order\_qty} \rceil \times \text{min\_order\_qty})$$
+
+### 8. Status Priority Order
+Status is evaluated strictly in this sequence:
+1. **CRITICAL**: `current_stock == 0` or `days_of_cover < lead_time_days`
+2. **OVERSTOCK**: `days_of_cover > 90`
+3. **REORDER**: `current_stock <= ROP`
+4. **OK**: otherwise
 
 ---
 
-## Demo Credentials & Access Roles
+## Installation & Requirements
 
-The seed script creates 3 ready-to-use accounts demonstrating Role-Based Access Control:
+StockSense uses **only** the Python Standard Library (`argparse`, `csv`, `json`, `statistics`, `math`, `datetime`) plus `pytest` for tests.
 
-| Role | Email | Password | Permissions |
+Ensure Python 3.8+ is installed.
+
+```bash
+# Install pytest for running tests
+pip install pytest
+```
+
+---
+
+## CLI Usage
+
+### Basic Reorder Report
+Run the reorder engine with the default 30-day moving window:
+```bash
+python stocksense.py --products data/products.csv --sales data/sales.csv --window 30
+```
+
+### Export Actionable Reorder List
+Export only `CRITICAL` and `REORDER` items to CSV:
+```bash
+python stocksense.py --products data/products.csv --sales data/sales.csv --export reorder_list.csv
+```
+
+### Enable Outlier Capping and Disable Colors
+```bash
+python stocksense.py --products data/products.csv --sales data/sales.csv --cap-outliers --no-color
+```
+
+### Advanced Configurable Parameters
+```bash
+python stocksense.py \
+  --products data/products.csv \
+  --sales data/sales.csv \
+  --window 45 \
+  --z-score 1.96 \
+  --order-cost 400 \
+  --holding-cost-pct 0.25 \
+  --export my_reorder.csv
+```
+
+### CLI Flag Reference
+| Flag | Type | Default | Description |
 |---|---|---|---|
-| **ADMIN** | `admin@stocksense.dev` | `Admin@12345` | Full access: User management, system configuration, all modules |
-| **MANAGER** | `manager@stocksense.dev` | `Manager@12345` | Inventory, products, suppliers, forecast pipeline, PO approval & receiving |
-| **STAFF** | `staff@stocksense.dev` | `Staff@12345` | Record sales, import sales CSV, view products & available inventory |
-
-*Quick-Fill buttons are available on the `/login` page for fast role switching.*
-
----
-
-## Quickstart Instructions
-
-### Option A: Running with Docker Compose (Recommended)
-
-1. Clone or navigate to the repository directory:
-   ```bash
-   cd CP_12_stocksense
-   ```
-
-2. Copy the sample environment file:
-   ```bash
-   cp .env.example .env
-   ```
-
-3. Launch all services:
-   ```bash
-   docker compose up --build -d
-   ```
-
-4. The application services will start:
-   - **Frontend UI**: [http://localhost:5173](http://localhost:5173)
-   - **FastAPI Backend & Swagger**: [http://localhost:8000/docs](http://localhost:8000/docs)
-   - **PostgreSQL**: `localhost:5432`
-   - **Redis**: `localhost:6379`
-   - **Celery Worker & Scheduler**: Running in background
+| `--products` | `string` | *(Required)* | Path to products file (`.csv` or `.json`) |
+| `--sales` | `string` | *(Required)* | Path to sales transactions file (`.csv` or `.json`) |
+| `--window` | `int` | `30` | Moving average window in days |
+| `--export` | `string` | `None` | CSV destination for CRITICAL and REORDER items |
+| `--menu` | `flag` | `False` | Launch interactive terminal menu |
+| `--no-color` | `flag` | `False` | Disable ANSI color codes in table output |
+| `--cap-outliers`| `flag` | `False` | Cap daily sales outliers at $\mu + 3\sigma$ |
+| `--z-score` | `float` | `1.65` | Service level $Z$-score (e.g. 1.65 for 95%, 1.96 for 97.5%) |
+| `--order-cost` | `float` | `500.0` | Fixed cost per replenishment order |
+| `--holding-cost-pct` | `float` | `0.20` | Annual holding cost percentage of unit cost |
+| `--reference-date` | `string` | `None` | YYYY-MM-DD anchor date (defaults to latest sales date) |
 
 ---
 
-### Option B: Running Locally without Docker
+## Interactive Menu
 
-#### 1. Backend Setup
-1. Open a terminal in `backend/`:
-   ```bash
-   cd backend
-   python -m venv venv
-   # On Windows:
-   .\venv\Scripts\activate
-   # On macOS/Linux:
-   source venv/bin/activate
-   ```
-
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-3. Initialize the database and run the deterministic seed script:
-   ```bash
-   python -m app.seed.seed_data
-   ```
-   *(This creates 30 products, 5 suppliers, 1 warehouse, 180 days of daily sales, opening balances, ledger history, forecast runs, and active recommendations).*
-
-4. Start the FastAPI development server:
-   ```bash
-   uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
-   ```
-
-#### 2. Frontend Setup
-1. In a separate terminal, navigate to `frontend/`:
-   ```bash
-   cd frontend
-   npm install
-   ```
-
-2. Start the Vite dev server:
-   ```bash
-   npm run dev
-   ```
-
-3. Open [http://localhost:5173](http://localhost:5173) in your browser.
-
----
-
-## Running the Automated Test Suite
-
-StockSense includes an exhaustive Pytest test suite covering all critical business rules:
-- Role-based route restrictions and authorization boundaries
-- Strict non-negative inventory enforcement under concurrent deductions
-- Mandatory reason validation for stock adjustments
-- Multi-line CSV sales import and atomic rollback on invalid rows
-- Duplicate line rejection
-- Cold-start fallback logic and stockout demand censoring
-- Inbound supply eligibility and overdue PO exclusion
-- Supplier MOQ and pack-size rounding calculations
-- Stale recommendation approval prevention (`409 Conflict`)
-- Purchase order placement, partial receiving, and over-receipt prevention
-
-To run the full suite:
-
+Launch the interactive console with `--menu`:
 ```bash
-# From the project root:
-$env:PYTHONPATH="backend"; .\backend\venv\Scripts\python.exe -m pytest backend\tests -v
+python stocksense.py --products data/products.csv --sales data/sales.csv --menu
 ```
 
-### Verified Test Results
+### Menu Options:
+1. **Show reorder report**: Computes and displays the urgency-sorted inventory table and summary.
+2. **Add sales record**: Records a new transaction (SKU, date, quantity sold) and integrates it into subsequent calculations.
+3. **Update stock**: Modifies on-hand stock for a SKU and updates days of cover and status.
+4. **Show item forecast (by SKU)**: Displays item details, sales statistics, ROP, safety stock, and recommended batch sizes.
+5. **Export reorder list**: Exports current replenishment recommendations to a chosen CSV path.
+6. **Exit**: Gracefully terminates the session.
+
+---
+
+## Terminal Output Sample
 
 ```text
-============================= test session starts =============================
-platform win32 -- Python 3.13.14, pytest-9.2.0, pluggy-1.7.0
-rootdir: C:\Users\Keerthish\OneDrive\Attachments\Desktop\CP_12_stocksense
-collected 18 items
-
-backend/tests/test_auth_and_roles.py::test_login_success PASSED                         [  5%]
-backend/tests/test_auth_and_roles.py::test_login_invalid_password PASSED                [ 11%]
-backend/tests/test_auth_and_roles.py::test_admin_user_management_role_restriction PASSED[ 16%]
-backend/tests/test_auth_and_roles.py::test_staff_cannot_create_stock_adjustment PASSED [ 22%]
-backend/tests/test_auth_and_roles.py::test_manager_can_create_stock_adjustment PASSED   [ 27%]
-backend/tests/test_forecast_and_reorder.py::test_cold_start_insufficient_history_behavior PASSED [ 33%]
-backend/tests/test_forecast_and_reorder.py::test_cold_start_with_manual_fallback PASSED[ 38%]
-backend/tests/test_forecast_and_reorder.py::test_inbound_eligibility_and_overdue_exclusion PASSED [ 44%]
-backend/tests/test_forecast_and_reorder.py::test_moq_and_pack_size_rounding PASSED     [ 47%]
-backend/tests/test_forecast_and_reorder.py::test_stale_recommendation_approval_rejected PASSED [ 52%]
-backend/tests/test_forecast_and_reorder.py::test_forecast_evaluation_report_endpoint PASSED [ 57%]
-backend/tests/test_inventory_and_ledger.py::test_atomic_stock_movement_and_ledger PASSED [ 63%]
-backend/tests/test_inventory_and_ledger.py::test_negative_stock_strictly_prevented PASSED [ 68%]
-backend/tests/test_inventory_and_ledger.py::test_stock_adjustment_mandatory_reason_validation PASSED [ 73%]
-backend/tests/test_purchase_orders_and_receiving.py::test_purchase_order_lifecycle_and_partial_receiving PASSED [ 78%]
-backend/tests/test_sales_and_import.py::test_manual_sale_success PASSED                 [ 84%]
-backend/tests/test_sales_and_import.py::test_manual_sale_insufficient_stock_fails PASSED[ 89%]
-backend/tests/test_sales_and_import.py::test_csv_import_success_and_duplicate_prevention PASSED [ 94%]
-backend/tests/test_sales_and_import.py::test_csv_import_atomic_rollback_on_invalid_row PASSED [100%]
-
-====================== 19 passed in 10.73s =======================
+SKU     | Item                              | Stock | AvgDemand |  ROP | Cover(d) |  Status   | Order Qty
+--------+-----------------------------------+-------+-----------+------+----------+-----------+----------
+SKU-001 | Ergonomic Wireless Mouse          |     0 |      5.60 | 62.2 |      0.0 | CRITICAL  |       640
+SKU-002 | Mechanical RGB Keyboard           |    12 |      3.73 | 64.2 |      3.2 | CRITICAL  |       330
+SKU-003 | Ultra-Wide Gaming Monitor         |    20 |      1.93 | 26.3 |     10.3 |  REORDER  |       110
+SKU-010 | Bluetooth Conference Speakerphone |    18 |      1.43 | 21.3 |     12.6 |  REORDER  |       180
+SKU-005 | Noise-Cancelling Headphones       |    28 |      2.20 | 33.7 |     12.7 |  REORDER  |       195
+SKU-004 | USB-C Multiport Dock              |    35 |      2.97 | 30.5 |     11.8 |    OK     |         0
+SKU-009 | Fast Qi Wireless Charger          |    75 |      1.40 | 18.7 |     53.6 |    OK     |         0
+SKU-006 | Anodized Aluminum Laptop Stand    |    85 |      1.57 | 22.9 |     54.3 |    OK     |         0
+SKU-007 | 1080p HD Streaming Webcam         |   120 |      1.73 | 17.1 |     69.2 |    OK     |         0
+SKU-012 | Smart IoT Power Strip 6-Outlet    |    25 |      0.00 |  0.0 |      N/A |    OK     |         0
+SKU-008 | Braided HDMI 2.1 Cable 2m         |   650 |      1.47 | 10.9 |    443.2 | OVERSTOCK |         0
+SKU-011 | Microfiber Screen Cleaning Cloths |  1500 |      2.93 | 26.8 |    511.4 | OVERSTOCK |         0
+--------+-----------------------------------+-------+-----------+------+----------+-----------+----------
+Summary: 2 critical, 3 reorder, 5 ok, 2 overstock
 ```
 
 ---
 
-## Verifying the Production Frontend Build
+## Running the Unit Tests
 
+Execute the full automated test suite with `pytest`:
 ```bash
-cd frontend
-npm run build
+python -m pytest -v
 ```
 
-Build Output:
-```text
-> tsc && vite build
-
-vite v6.4.6 building for production...
-✓ 2060 modules transformed.
-dist/index.html                   0.82 kB │ gzip:   0.48 kB
-dist/assets/index-DkHu3091.css   30.00 kB │ gzip:   5.97 kB
-dist/assets/index-PaoDLXob.js   819.48 kB │ gzip: 215.84 kB
-✓ built in 7.44s
-```
-
----
-
-## Scope Boundaries & Assumptions
-
-1. **Warehouse Model**: The database schema and business logic include `warehouse_id` on all inventory balances, stock movements, and purchase orders. The MVP targets a single regional warehouse (`WH-BLR-01`) with multi-warehouse extensibility preserved in all query signatures.
-2. **Backorders & Reservations**: For the MVP, `reserved_qty` is maintained at 0 and unreserved backorders are assumed to be 0 in the Inventory Position equation.
-3. **Currency & Localization**: All currency metrics are formatted in Indian Rupees (`₹` / INR) with two decimal places. Timestamps are stored in UTC in the database and rendered in `Asia/Kolkata` (IST, UTC+05:30) across the UI.
-4. **No External Paid AI/APIs**: All forecasting methods (Trailing 7d, Trailing 28d, Seasonal Naive) are computed locally using NumPy and Pandas with zero external API dependencies.
-
----
-
-## License
-
-MIT License. Designed and engineered for retail inventory management.
+The test suite covers:
+- Hand-calculated moving averages and standard deviations.
+- Handling of days with no sales as 0.0.
+- Outlier detection and capping.
+- Safety stock and ROP calculations.
+- Economic Order Quantity (EOQ) with `min_order_qty` thresholding and multiple rounding.
+- Strict evaluation order of all status rules (`CRITICAL`, `OVERSTOCK`, `REORDER`, `OK`).
+- Edge cases: items with zero demand, brand new products with no sales history, division-by-zero protection.
+- Input validation: missing SKUs, duplicate SKUs, negative stocks/costs/quantities, invalid dates, non-numeric values, and unknown SKUs in sales logs.

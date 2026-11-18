@@ -1,0 +1,6 @@
+sku,name,supplier,current_stock,lead_time_days,avg_daily_demand,rop,days_of_cover,status,order_qty,unit_cost,total_cost
+SKU-001,Ergonomic Wireless Mouse,TechGear Ltd,0,7,5.6,62.2,0.00,CRITICAL,640,25.00,16000.00
+SKU-002,Mechanical RGB Keyboard,KeyWorks Co,12,14,3.73,64.17,3.21,CRITICAL,330,65.00,21450.00
+SKU-003,Ultra-Wide Gaming Monitor,VisionTech,20,10,1.93,26.31,10.34,REORDER,110,320.00,35200.00
+SKU-010,Bluetooth Conference Speakerphone,AcousticLab,18,10,1.43,21.28,12.56,REORDER,180,85.00,15300.00
+SKU-005,Noise-Cancelling Headphones,AcousticLab,28,12,2.2,33.66,12.73,REORDER,195,110.00,21450.00

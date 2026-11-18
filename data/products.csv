@@ -1,0 +1,13 @@
+sku,name,current_stock,supplier,lead_time_days,unit_cost,min_order_qty
+SKU-001,Ergonomic Wireless Mouse,0,TechGear Ltd,7,25.0,20
+SKU-002,Mechanical RGB Keyboard,12,KeyWorks Co,14,65.0,10
+SKU-003,Ultra-Wide Gaming Monitor,20,VisionTech,10,320.0,5
+SKU-004,USB-C Multiport Dock,35,ConnectPro,8,45.0,25
+SKU-005,Noise-Cancelling Headphones,28,AcousticLab,12,110.0,15
+SKU-006,Anodized Aluminum Laptop Stand,85,DeskMasters,10,30.0,20
+SKU-007,1080p HD Streaming Webcam,120,VisionTech,7,40.0,25
+SKU-008,Braided HDMI 2.1 Cable 2m,650,ConnectPro,5,8.5,50
+SKU-009,Fast Qi Wireless Charger,75,VoltCore,10,18.0,20
+SKU-010,Bluetooth Conference Speakerphone,18,AcousticLab,10,85.0,10
+SKU-011,Microfiber Screen Cleaning Cloths,1500,CleanTech,7,2.5,100
+SKU-012,Smart IoT Power Strip 6-Outlet,25,VoltCore,14,35.0,15
